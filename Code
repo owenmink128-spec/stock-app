@@ -1,0 +1,403 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import alpaca_trade_api as tradeapi
+import time
+from datetime import datetime, timedelta
+import pytz
+
+# ======================
+# SETTINGS
+# ======================
+SYMBOL = "AAPL"
+RISK_PER_TRADE = 0.01          # 1% risk per trade
+BOX_PERIOD = 30                # candles used to define box
+POLL_INTERVAL = 300            # 5 minutes
+TIMEFRAME = "5m"
+DATA_PERIOD = "1mo"
+
+MAX_TRADES_PER_DAY = 3
+MAX_DAILY_LOSS_PCT = 0.03      # stop trading after 3% daily loss
+COOLDOWN_MINUTES = 30          # wait after a trade before entering again
+TRAILING_STOP_ATR = 1.2
+STOP_ATR_MULT = 1.5
+TP_ATR_MULT = 3.0
+BREAKOUT_BUFFER = 0.0015       # 0.15% breakout confirmation
+BOUNCE_BUFFER = 0.01           # 1% above support counts as bounce
+MIN_VOLUME_MULT = 1.5
+
+# ======================
+# ALPACA API SETUP
+# ======================
+API_KEY = "YOUR_ALPACA_KEY"
+API_SECRET = "YOUR_ALPACA_SECRET"
+BASE_URL = "https://paper-api.alpaca.markets"
+
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+
+# ======================
+# GLOBAL STATE
+# ======================
+last_trade_time = None
+trades_today = 0
+today_date = datetime.now().date()
+starting_equity_today = None
+
+# Track trade-specific state
+position_state = {
+    "entry_price": None,
+    "stop_loss": None,
+    "take_profit": None,
+    "highest_price": None,
+    "entry_type": None
+}
+
+# ======================
+# HELPER FUNCTIONS
+# ======================
+def log(msg):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+def is_market_open():
+    try:
+        clock = api.get_clock()
+        return clock.is_open
+    except:
+        return False
+
+def reset_daily_counters():
+    global trades_today, today_date, starting_equity_today
+    current_date = datetime.now().date()
+    if current_date != today_date:
+        today_date = current_date
+        trades_today = 0
+        try:
+            starting_equity_today = float(api.get_account().equity)
+        except:
+            starting_equity_today = None
+        log("New trading day reset.")
+
+def get_account_cash():
+    return float(api.get_account().cash)
+
+def get_account_equity():
+    return float(api.get_account().equity)
+
+def daily_loss_exceeded():
+    global starting_equity_today
+    try:
+        if starting_equity_today is None:
+            starting_equity_today = get_account_equity()
+            return False
+        current_equity = get_account_equity()
+        drawdown = (starting_equity_today - current_equity) / starting_equity_today
+        return drawdown >= MAX_DAILY_LOSS_PCT
+    except:
+        return False
+
+def fetch_data(symbol, period=DATA_PERIOD, interval=TIMEFRAME):
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+    if df.empty:
+        return df
+    return df.dropna()
+
+def calculate_position_size(cash, risk, entry, stop):
+    risk_amount = cash * risk
+    per_share_risk = abs(entry - stop)
+    if per_share_risk <= 0:
+        return 0
+    size = int(risk_amount / per_share_risk)
+    max_affordable = int(cash / entry)
+    return max(0, min(size, max_affordable))
+
+def get_open_position(symbol):
+    try:
+        positions = api.list_positions()
+        for p in positions:
+            if p.symbol == symbol:
+                return p
+        return None
+    except:
+        return None
+
+def cancel_open_orders(symbol):
+    try:
+        orders = api.list_orders(status='open')
+        for order in orders:
+            if order.symbol == symbol:
+                api.cancel_order(order.id)
+                log(f"Cancelled open order: {order.id}")
+    except Exception as e:
+        log(f"Error cancelling orders: {e}")
+
+def cooldown_active():
+    global last_trade_time
+    if last_trade_time is None:
+        return False
+    return datetime.now() < last_trade_time + timedelta(minutes=COOLDOWN_MINUTES)
+
+def mark_trade_time():
+    global last_trade_time, trades_today
+    last_trade_time = datetime.now()
+    trades_today += 1
+
+# ======================
+# INDICATORS
+# ======================
+def add_indicators(data):
+    data = data.copy()
+
+    data['EMA50'] = data['Close'].ewm(span=50, adjust=False).mean()
+    data['EMA200'] = data['Close'].ewm(span=200, adjust=False).mean()
+
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    data['RSI'] = 100 - (100 / (1 + rs))
+
+    high_low = data['High'] - data['Low']
+    high_close = (data['High'] - data['Close'].shift()).abs()
+    low_close = (data['Low'] - data['Close'].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    data['ATR'] = true_range.rolling(14).mean()
+
+    data['avg_volume'] = data['Volume'].rolling(20).mean()
+
+    return data.dropna()
+
+# ======================
+# ENTRY / EXIT LOGIC
+# ======================
+def check_entry(data):
+    last = data.iloc[-1]
+    prev = data.iloc[-2]
+    window = data.iloc[-BOX_PERIOD:]
+
+    support = window['Low'].min()
+    resistance = window['High'].max()
+
+    price = float(last['Close'])
+    prev_close = float(prev['Close'])
+    rsi = float(last['RSI'])
+    atr = float(last['ATR'])
+    volume = float(last['Volume'])
+    avg_vol = float(last['avg_volume'])
+    trend_up = last['EMA50'] > last['EMA200']
+
+    # Bounce trade
+    bounce_signal = (
+        price <= support * (1 + BOUNCE_BUFFER)
+        and rsi < 38
+        and trend_up
+        and price > prev_close
+    )
+
+    # Breakout trade with confirmation
+    breakout_signal = (
+        price > resistance * (1 + BREAKOUT_BUFFER)
+        and prev_close <= resistance
+        and volume > avg_vol * MIN_VOLUME_MULT
+        and rsi > 50
+        and trend_up
+    )
+
+    if bounce_signal:
+        stop_loss = price - atr * STOP_ATR_MULT
+        take_profit = resistance
+        return {
+            "type": "bounce",
+            "entry": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "support": support,
+            "resistance": resistance,
+            "atr": atr
+        }
+
+    if breakout_signal:
+        stop_loss = price - atr * STOP_ATR_MULT
+        take_profit = price + atr * TP_ATR_MULT
+        return {
+            "type": "breakout",
+            "entry": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "support": support,
+            "resistance": resistance,
+            "atr": atr
+        }
+
+    return None
+
+def submit_buy(symbol, entry_data):
+    global position_state
+
+    cash = get_account_cash()
+    size = calculate_position_size(cash, RISK_PER_TRADE, entry_data["entry"], entry_data["stop_loss"])
+
+    if size <= 0:
+        log("Position size too small. Skipping trade.")
+        return False
+
+    try:
+        cancel_open_orders(symbol)
+
+        api.submit_order(
+            symbol=symbol,
+            qty=size,
+            side='buy',
+            type='market',
+            time_in_force='gtc'
+        )
+
+        position_state["entry_price"] = entry_data["entry"]
+        position_state["stop_loss"] = entry_data["stop_loss"]
+        position_state["take_profit"] = entry_data["take_profit"]
+        position_state["highest_price"] = entry_data["entry"]
+        position_state["entry_type"] = entry_data["type"]
+
+        mark_trade_time()
+
+        log(
+            f"BUY {entry_data['type'].upper()} | "
+            f"Price: {entry_data['entry']:.2f} | "
+            f"SL: {entry_data['stop_loss']:.2f} | "
+            f"TP: {entry_data['take_profit']:.2f} | "
+            f"Shares: {size}"
+        )
+        return True
+
+    except Exception as e:
+        log(f"Buy order failed: {e}")
+        return False
+
+def submit_sell(symbol, qty, reason, price):
+    global position_state
+
+    try:
+        cancel_open_orders(symbol)
+
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side='sell',
+            type='market',
+            time_in_force='gtc'
+        )
+
+        log(f"SELL {reason.upper()} | Price: {price:.2f} | Qty: {qty}")
+
+        position_state = {
+            "entry_price": None,
+            "stop_loss": None,
+            "take_profit": None,
+            "highest_price": None,
+            "entry_type": None
+        }
+
+        mark_trade_time()
+        return True
+
+    except Exception as e:
+        log(f"Sell order failed: {e}")
+        return False
+
+def manage_position(data, position):
+    global position_state
+
+    last = data.iloc[-1]
+    window = data.iloc[-BOX_PERIOD:]
+
+    price = float(last['Close'])
+    atr = float(last['ATR'])
+    resistance = float(window['High'].max())
+    qty = int(float(position.qty))
+
+    if position_state["entry_price"] is None:
+        entry_price = float(position.avg_entry_price)
+        position_state["entry_price"] = entry_price
+        position_state["stop_loss"] = entry_price - atr * STOP_ATR_MULT
+        position_state["take_profit"] = entry_price + atr * TP_ATR_MULT
+        position_state["highest_price"] = price
+
+    # Update highest price
+    if price > position_state["highest_price"]:
+        position_state["highest_price"] = price
+
+    # Trailing stop
+    trailing_stop = position_state["highest_price"] - atr * TRAILING_STOP_ATR
+    effective_stop = max(position_state["stop_loss"], trailing_stop)
+
+    # Exit checks
+    if price <= effective_stop:
+        submit_sell(SYMBOL, qty, "stop_loss", price)
+
+    elif price >= position_state["take_profit"]:
+        submit_sell(SYMBOL, qty, "take_profit", price)
+
+    elif position_state["entry_type"] == "bounce" and price >= resistance * 0.99:
+        submit_sell(SYMBOL, qty, "range_exit", price)
+
+# ======================
+# MAIN LOOP
+# ======================
+log("Starting advanced Box Theory bot...")
+
+try:
+    starting_equity_today = get_account_equity()
+except:
+    starting_equity_today = None
+
+while True:
+    try:
+        reset_daily_counters()
+
+        if not is_market_open():
+            log("Market closed. Waiting...")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if daily_loss_exceeded():
+            log("Max daily loss reached. Trading paused for today.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if trades_today >= MAX_TRADES_PER_DAY:
+            log("Max trades reached for today.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        data = fetch_data(SYMBOL)
+
+        if data.empty or len(data) < 220:
+            log("Not enough data yet.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        data = add_indicators(data)
+
+        if len(data) < BOX_PERIOD + 5:
+            log("Indicator data not ready.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        position = get_open_position(SYMBOL)
+
+        if position is None:
+            if cooldown_active():
+                log("Cooldown active. Waiting...")
+            else:
+                entry = check_entry(data)
+                if entry:
+                    submit_buy(SYMBOL, entry)
+                else:
+                    log("No trade setup.")
+        else:
+            manage_position(data, position)
+
+        time.sleep(POLL_INTERVAL)
+
+    except Exception as e:
+        log(f"Error: {e}")
+        time.sleep(POLL_INTERVAL)
